@@ -1,5 +1,8 @@
 import sys
+import os
+import csv
 import cv2
+from datetime import datetime
 from ultralytics import YOLO
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout,
@@ -32,6 +35,7 @@ class StrawberryDetector(QWidget):
         self.load_model_btn = QPushButton("📦 Load Model")
         self.load_video_btn = QPushButton("📂 Open Video")
         self.open_cam_btn = QPushButton("🎥 Open Camera")
+        self.open_image_btn = QPushButton("🖼️ Open Image")
         self.stop_btn = QPushButton("⛔ Stop")
 
         layout = QGridLayout()
@@ -42,6 +46,7 @@ class StrawberryDetector(QWidget):
         btn_layout.addWidget(self.load_model_btn)
         btn_layout.addWidget(self.load_video_btn)
         btn_layout.addWidget(self.open_cam_btn)
+        btn_layout.addWidget(self.open_image_btn)
         btn_layout.addWidget(self.stop_btn)
 
         layout.addLayout(btn_layout, 1, 0, 1, 2)
@@ -52,7 +57,26 @@ class StrawberryDetector(QWidget):
         self.load_model_btn.clicked.connect(self.load_model)
         self.load_video_btn.clicked.connect(self.load_video)
         self.open_cam_btn.clicked.connect(self.open_camera)
+        self.open_image_btn.clicked.connect(self.load_image)
         self.stop_btn.clicked.connect(self.stop_video)
+
+        # Ensure folders exist
+        os.makedirs("results/images", exist_ok=True)
+        os.makedirs("results/coords", exist_ok=True)
+        os.makedirs("results/center_points/images", exist_ok=True)
+        os.makedirs("results/center_points/coords", exist_ok=True)
+
+        # CSV files
+        self.csv_path = "results/coords/detections.csv"
+        self.center_csv_path = "results/center_points/coords/center_points.csv"
+
+        with open(self.csv_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["filename", "class", "confidence", "x1", "y1", "x2", "y2"])
+
+        with open(self.center_csv_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["filename", "class", "confidence", "x1", "y1", "x2", "y2", "center_x", "center_y"])
 
     def load_model(self):
         model_path, _ = QFileDialog.getOpenFileName(self, "Select YOLOv8 Model (.pt)", "", "Model Files (*.pt)")
@@ -73,6 +97,12 @@ class StrawberryDetector(QWidget):
         self.cap = cv2.VideoCapture(0)
         self.timer.start(30)
 
+    def load_image(self):
+        image_path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Image Files (*.jpg *.png *.jpeg)")
+        if image_path and self.model:
+            frame = cv2.imread(image_path)
+            self.process_frame(frame)
+
     def stop_video(self):
         self.timer.stop()
         if self.cap:
@@ -85,47 +115,79 @@ class StrawberryDetector(QWidget):
             if not ret:
                 self.stop_video()
                 return
+            self.process_frame(frame)
 
-            if self.model:
-                results = self.model.predict(source=frame, conf=0.25, verbose=False)
-                result = results[0]
-                annotated_frame = result.plot()
+    def process_frame(self, frame):
+        results = self.model.predict(source=frame, conf=0.25, verbose=False)
+        result = results[0]
+        annotated_frame = result.plot()
 
-                # Clear previous crops
-                for i in reversed(range(self.crop_grid.count())):
-                    widget_to_remove = self.crop_grid.itemAt(i).widget()
-                    if widget_to_remove is not None:
-                        widget_to_remove.setParent(None)
+        # Clear previous crops
+        for i in reversed(range(self.crop_grid.count())):
+            widget_to_remove = self.crop_grid.itemAt(i).widget()
+            if widget_to_remove:
+                widget_to_remove.setParent(None)
 
-                col_count = 3
-                row = 0
+        col_count = 2
+        row = 0
+        col = 0
+
+        for i, box in enumerate(result.boxes):
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            conf = float(box.conf[0])
+            cls_id = int(box.cls[0])
+            class_name = self.class_names[cls_id]
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+
+            crop_img = frame[y1:y2, x1:x2]
+            crop_img_resized = cv2.resize(crop_img, (160, 120))
+            crop_rgb = cv2.cvtColor(crop_img_resized, cv2.COLOR_BGR2RGB)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"{class_name}_{timestamp}.jpg"
+
+            # Save cropped image
+            save_path = os.path.join("results/images", filename)
+            save_center_path = os.path.join("results/center_points/images", filename)
+            cv2.imwrite(save_path, crop_rgb[..., ::-1])  # BGR
+            cv2.imwrite(save_center_path, crop_rgb[..., ::-1])
+
+            # Write detection CSV
+            with open(self.csv_path, mode="a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([filename, class_name, round(conf, 2), x1, y1, x2, y2])
+
+            # Write center point CSV
+            with open(self.center_csv_path, mode="a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([filename, class_name, round(conf, 2), x1, y1, x2, y2, center_x, center_y])
+
+            # Display crop with coordinates
+            h, w, ch = crop_rgb.shape
+            qimg = QImage(crop_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+
+            label = QLabel()
+            label.setPixmap(pixmap)
+            label_text = QLabel(f"{class_name} ({conf:.2f})\n[{x1},{y1},{x2},{y2}]\n({center_x},{center_y})")
+            vbox = QVBoxLayout()
+            vbox.addWidget(label)
+            vbox.addWidget(label_text)
+            container = QWidget()
+            container.setLayout(vbox)
+            self.crop_grid.addWidget(container, row, col)
+
+            col += 1
+            if col >= col_count:
                 col = 0
+                row += 1
 
-                # Display detected strawberry crops
-                for box in result.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    crop_img = frame[y1:y2, x1:x2]
-                    crop_img = cv2.resize(crop_img, (160, 120))
-                    crop_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-                    h, w, ch = crop_rgb.shape
-                    qimg = QImage(crop_rgb.data, w, h, ch * w, QImage.Format_RGB888)
-                    pixmap = QPixmap.fromImage(qimg)
-
-                    label = QLabel()
-                    label.setPixmap(pixmap)
-                    self.crop_grid.addWidget(label, row, col)
-
-                    col += 1
-                    if col >= col_count:
-                        col = 0
-                        row += 1
-
-                # Display the main annotated frame
-                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qimg = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                self.video_label.setPixmap(QPixmap.fromImage(qimg))
+        # Display main video frame
+        rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        qimg = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
+        self.video_label.setPixmap(QPixmap.fromImage(qimg))
 
 
 if __name__ == "__main__":
